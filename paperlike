@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """paperlike: control a DASUNG Paperlike Pro e-ink monitor over its HDMI control channel (DDC/CI).
 
-Every command is "Set VCP 0x08 = CMD:ARG" (see NOTES.md). The monitor answers each one with an
+Every command is "Set VCP 0x08 = CMD:ARG" (see docs/protocol.md). The monitor answers each one with an
 11-byte reply whose ML byte is a type (01 heartbeat, 07 mode/button) and SL byte a value.
 
   paperlike detect                  find the monitor (connector, I2C bus)
@@ -10,13 +10,16 @@ Every command is "Set VCP 0x08 = CMD:ARG" (see NOTES.md). The monitor answers ea
   paperlike contrast 6              per-mode contrast (floyd 1-9, a2 130-250, a5 80-200)
   paperlike clear [--full]          ghost clear (quick by default)
   paperlike wake [--mode a2]        bring the picture back: re-send HDMI, then mode + full clear
-  paperlike watch                   wake automatically whenever the monitor is plugged in
+  paperlike watch                   wake automatically whenever the monitor is plugged in (polls sysfs)
   paperlike raw 07 02 06 02         send raw CMD ARG pairs (hex)
+  paperlike --bus 5 clear           skip the bus search; refused if bus 5's EDID or sysfs says it's another monitor
 
 Linux only for now (i2c-dev). wake/watch re-send the picture through the desktop's own tools:
-Hyprland (hyprctl), sway (swaymsg), other wlroots compositors (wlr-randr), KDE (kscreen-doctor), X11 (xrandr).
+Hyprland (hyprctl, also from a systemd user service or ssh), sway (swaymsg), other wlroots compositors
+(wlr-randr), KDE (kscreen-doctor), X11 (xrandr).
 """
 import argparse
+import errno
 import fcntl
 import glob
 import json
@@ -25,6 +28,8 @@ import shutil
 import subprocess
 import sys
 import time
+
+__version__ = "0.1.0"
 
 I2C_SLAVE = 0x0703
 DDC_ADDR = 0x37
@@ -37,6 +42,8 @@ CONTRAST = {1: (0x08, 1, 9, 5), 2: (0x09, 130, 250, 190), 4: (0x0B, 80, 200, 160
 # how long the vendor apps wait before reading the reply (seconds)
 WAITS = {0x01: 0.1, 0x02: 0.6, 0x04: 0.6, 0x06: 0.5, 0x07: 0.8}
 STATE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "paperlike", "state.json")
+SYS_DRM = "/sys/class/drm"
+SYS_I2C = "/sys/bus/i2c/devices"
 
 
 def log(msg):
@@ -60,9 +67,12 @@ def load_state():
 def save_state(**kw):
     s = load_state()
     s.update(kw)
-    os.makedirs(os.path.dirname(STATE), exist_ok=True)
-    with open(STATE, "w") as f:
-        json.dump(s, f)
+    try:  # only a cache: never fail a command because it can't be written
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE, "w") as f:
+            json.dump(s, f)
+    except OSError:
+        pass
 
 
 # ---- finding the monitor (Linux DRM + i2c-dev) ----
@@ -82,42 +92,140 @@ def read_edid(bus):
         os.close(fd)
 
 
+def read_file(path, mode="r"):
+    with open(path, mode) as f:
+        return f.read()
+
+
+def connector_name(path):
+    return os.path.basename(path).split("-", 1)[1]  # card1-HDMI-A-1 -> HDMI-A-1
+
+
+def ddc_link(path):
+    """The bus a DRM connector's ddc link names ("i2c-3"; i915/amdgpu/nouveau), or None (NVIDIA has none)."""
+    ddc = os.path.join(path, "ddc")
+    return os.path.basename(os.readlink(ddc)) if os.path.islink(ddc) else None
+
+
+def gpu_buses(path):
+    """The I2C buses that belong to the same GPU as a DRM connector (where NVIDIA's DDC buses are)."""
+    card = os.path.realpath(os.path.join(os.path.dirname(path), os.path.basename(path).split("-")[0], "device"))
+    return [int(dev.rsplit("-", 1)[1]) for dev in sorted(glob.glob(f"{SYS_I2C}/i2c-*"))
+            if os.path.realpath(dev).startswith(card + "/")]
+
+
+def dasung_outputs():
+    """Connected DRM connectors with a DASUNG EDID, as {sysfs path: EDID}. Cached sysfs files only, no I2C."""
+    found = {}
+    for path in sorted(glob.glob(f"{SYS_DRM}/card*-*")):
+        try:
+            if read_file(f"{path}/status").strip() != "connected":
+                continue
+            edid = read_file(f"{path}/edid", "rb")
+        except OSError:
+            continue
+        if is_dasung(edid):
+            found[path] = edid
+    return found
+
+
 def find_dasung():
     """Return (connector, bus) or raise. Only ever reads (EDID); never writes to other monitors."""
     state = load_state()
-    for path in sorted(glob.glob("/sys/class/drm/card*-*")):
-        try:
-            if open(f"{path}/status").read().strip() != "connected":
-                continue
-            edid = open(f"{path}/edid", "rb").read()
-        except OSError:
-            continue
-        if not is_dasung(edid):
-            continue
-        connector = os.path.basename(path).split("-", 1)[1]
-        ddc = os.path.join(path, "ddc")
-        if os.path.islink(ddc):  # i915/amdgpu/nouveau expose the bus directly
-            return connector, int(os.path.basename(os.readlink(ddc)).split("-")[1])
+    for path, edid in dasung_outputs().items():
+        connector = connector_name(path)
+        link = ddc_link(path)
+        if link:  # i915/amdgpu/nouveau expose the bus directly
+            return connector, int(link.split("-")[1])
         # NVIDIA: match the EDID on the buses that belong to the same GPU
-        card = os.path.realpath(os.path.join(os.path.dirname(path), os.path.basename(path).split("-")[0], "device"))
-        for dev in sorted(glob.glob("/sys/bus/i2c/devices/i2c-*")):
-            if not os.path.realpath(dev).startswith(card + "/"):
-                continue
-            bus = int(dev.rsplit("-", 1)[1])
+        silent = []
+        for bus in gpu_buses(path):
             try:
-                if read_edid(bus)[:128] == edid[:128]:
-                    save_state(connector=connector, bus=bus)
-                    return connector, bus
+                same = read_edid(bus)[:128] == edid[:128]
             except OSError:
+                silent.append(bus)
                 continue
-        # a half-booted Dasung stops answering EDID reads; fall back to the last bus that matched
-        if state.get("connector") == connector and "bus" in state:
+            if same:
+                save_state(connector=connector, bus=bus)
+                return connector, bus
+        # a half-booted Dasung stops answering EDID reads; fall back to the last bus that matched if it's silent too
+        if state.get("connector") == connector and state.get("bus") in silent:
             return connector, state["bus"]
         raise SystemExit(f"Found the Dasung on {connector} but not its I2C bus. Pass --bus N (see `ddcutil detect`).")
     raise SystemExit("No Dasung Paperlike connected (no DRM connector with a DASUNG EDID).")
 
 
+def dasung_on_bus(bus, write=True):
+    """--bus N: return (connector, bus), taking the connector from sysfs. Refuses a bus whose EDID is readable
+    but isn't a connected Dasung's, or, with no EDID answer, that sysfs puts on another connector or GPU. For
+    writes it also refuses any bus while no Dasung is connected. connector is "?" when nothing verified the bus."""
+    outs = dasung_outputs()
+    try:
+        edid = read_edid(bus)[:128]
+    except (FileNotFoundError, PermissionError) as e:
+        raise SystemExit(f"Can't open /dev/i2c-{bus}: {e.strerror}")
+    except OSError as e:
+        if e.errno == errno.EBUSY:  # a kernel driver owns 0x50 there (e.g. RAM SPD), so it's no monitor's DDC bus
+            raise SystemExit(f"/dev/i2c-{bus} isn't a monitor's DDC bus (a kernel driver uses address 0x50). Not using it.")
+        edid = None  # a half-booted Dasung stops answering EDID reads, but so can another monitor in standby
+    if edid is not None:
+        outs = {p: e for p, e in outs.items() if e[:128] == edid}
+        if not outs:
+            raise SystemExit(f"/dev/i2c-{bus} answers with an EDID that isn't a connected Dasung's "
+                             "(another monitor?). Not using it.")
+    else:
+        # no EDID to go by, so only sysfs: the connectors whose ddc link is this bus, or else (NVIDIA, no links)
+        # a Dasung on the GPU this bus belongs to
+        owners = [p for p in sorted(glob.glob(f"{SYS_DRM}/card*-*")) if ddc_link(p) == f"i2c-{bus}"]
+        if owners:
+            outs = {p: e for p, e in outs.items() if p in owners}
+            if not outs:
+                raise SystemExit(f"/dev/i2c-{bus} is the DDC bus of {connector_name(owners[0])}, which isn't a "
+                                 "connected Dasung. Not using it.")
+        elif outs:
+            outs = {p: e for p, e in outs.items() if ddc_link(p) is None and bus in gpu_buses(p)}
+            if not outs:
+                raise SystemExit(f"/dev/i2c-{bus} doesn't answer EDID reads, and sysfs puts the Dasung on another bus "
+                                 "(see `paperlike detect`). Not using it.")
+        if not owners and not write:  # can't verify it; status only reads
+            return "?", bus
+        if not outs:
+            raise SystemExit(f"No Dasung Paperlike connected (no DRM connector with a DASUNG EDID). "
+                             f"Not writing to /dev/i2c-{bus}.")
+    state = load_state()
+
+    def rank(path):  # the connector wired to this bus, then the cached one, then the first
+        link = ddc_link(path)
+        if link:
+            return 0 if link == f"i2c-{bus}" else 3
+        return 1 if (state.get("connector"), state.get("bus")) == (connector_name(path), bus) else 2
+
+    connector = connector_name(min(outs, key=rank))
+    if edid is not None:
+        save_state(connector=connector, bus=bus)
+    return connector, bus
+
+
 # ---- talking to it ----
+
+def set_packet(cmd, arg):
+    """Set VCP 0x08 = CMD:ARG (every command): 51 84 03 08 CMD ARG chk."""
+    body = bytes([0x51, 0x84, 0x03, 0x08, cmd, arg])
+    return body + bytes([xor(body, 0x6E)])
+
+
+def get_packet():
+    """Get VCP 0x08 (read-only, sends no command): 51 82 01 08 chk."""
+    body = bytes([0x51, 0x82, 0x01, 0x08])
+    return body + bytes([xor(body, 0x6E)])
+
+
+def parse_reply(r):
+    """(type, value) from an 11-byte reply 6E 88 02 rc 08 type MH ML SH SL chk, or None if it isn't valid."""
+    if len(r) == 11 and r[2] == 0x02 and r[4] == 0x08 and r[10] == xor(r[:10], 0x50):
+        return r[7], r[9] & 0x0F
+    return None
+
 
 class Monitor:
     def __init__(self, bus):
@@ -129,23 +237,15 @@ class Monitor:
         os.close(self.fd)
 
     def send(self, cmd, arg):
-        body = bytes([0x51, 0x84, 0x03, 0x08, cmd, arg])
-        os.write(self.fd, body + bytes([xor(body, 0x6E)]))
+        os.write(self.fd, set_packet(cmd, arg))
         time.sleep(WAITS.get(cmd, 0.5))
-        r = os.read(self.fd, 11)
-        if len(r) == 11 and r[2] == 0x02 and r[4] == 0x08 and r[10] == xor(r[:10], 0x50):
-            return r[7], r[9] & 0x0F
-        return None
+        return parse_reply(os.read(self.fd, 11))
 
     def get(self):
         """Read-only status: a standard Get VCP 0x08 request (sends no command)."""
-        body = bytes([0x51, 0x82, 0x01, 0x08])
-        os.write(self.fd, body + bytes([xor(body, 0x6E)]))
+        os.write(self.fd, get_packet())
         time.sleep(0.1)
-        r = os.read(self.fd, 11)
-        if len(r) == 11 and r[2] == 0x02 and r[4] == 0x08 and r[10] == xor(r[:10], 0x50):
-            return r[7], r[9] & 0x0F
-        return None
+        return parse_reply(os.read(self.fd, 11))
 
     def run(self, pairs, quiet=False):
         replies = []
@@ -191,33 +291,74 @@ def have(cmd):
     return shutil.which(cmd) is not None
 
 
-def sh(*args):
-    subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
+def sh(*args, env=None):
+    subprocess.run(args, check=True, stdout=subprocess.DEVNULL, env=env)
+
+
+def hypr_live(d):
+    """True if Hyprland instance folder d is a running Hyprland's: its lock file's first line is a live PID.
+    On exit Hyprland deletes only the lock, so the folder (and its log) stays behind."""
+    try:
+        pid = int(read_file(os.path.join(d, "hyprland.lock")).split("\n", 1)[0])
+    except (OSError, ValueError):
+        return False
+    return os.path.exists(f"/proc/{pid}")
+
+
+def hyprland_env():
+    """Environment for hyprctl, or None if Hyprland isn't running (or this is a sway session). With a missing or
+    stale HYPRLAND_INSTANCE_SIGNATURE (a systemd user service, an ssh session, a restarted Hyprland), use the
+    running instance in $XDG_RUNTIME_DIR/hypr that started last, as hyprctl's own instance list does."""
+    if not have("hyprctl"):
+        return None
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    hypr = os.path.join(runtime, "hypr")
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    sway = os.environ.get("SWAYSOCK")
+    if not sig and sway and os.path.exists(sway):  # inside sway: leave a Hyprland running elsewhere alone
+        return None
+    if sig and not os.path.isdir(hypr):  # older Hyprland: /tmp/hypr
+        return os.environ
+    if sig and hypr_live(os.path.join(hypr, sig)):
+        return dict(os.environ, XDG_RUNTIME_DIR=runtime)
+
+    def started(d):  # signature: <commit>_<unix time>_<random>
+        try:
+            return int(os.path.basename(d).split("_")[1]), d
+        except (ValueError, IndexError):
+            return 0, d
+
+    live = [d for d in glob.glob(os.path.join(hypr, "*")) if hypr_live(d)]
+    if not live:
+        return None
+    sig = os.path.basename(max(live, key=started))
+    return dict(os.environ, HYPRLAND_INSTANCE_SIGNATURE=sig, XDG_RUNTIME_DIR=runtime)
 
 
 def relink(connector, off_seconds=4.0, settle=8.0):
     """Turn the output off and on so the monitor's video input re-locks onto the signal.
     Returns the output width when known (800 means the monitor should be in its 800x600 mode)."""
     width = None
-    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and have("hyprctl"):
-        mons = json.loads(subprocess.run(["hyprctl", "monitors", "-j"], check=True, capture_output=True, text=True).stdout)
+    hypr = hyprland_env()
+    if hypr is not None:
+        mons = json.loads(subprocess.run(["hyprctl", "monitors", "-j"], check=True, capture_output=True, text=True, env=hypr).stdout)
         m = next((m for m in mons if m["name"] == connector), None)
         if m is None:
             raise SystemExit(f"Hyprland doesn't list {connector} as active")
         width = m["width"]
         mode = f"{m['width']}x{m['height']}@{m['refreshRate']:.2f}"
         pos = f"{m['x']}x{m['y']}"
-        lua = subprocess.run(["hyprctl", "eval", "return 1"], capture_output=True, text=True).stdout.strip() == "ok"
+        lua = subprocess.run(["hyprctl", "eval", "return 1"], capture_output=True, text=True, env=hypr).stdout.strip() == "ok"
         log(f"hyprland: {connector} off for {off_seconds:.0f}s, then back to {mode} at {pos} scale {m['scale']:.4g}")
         if lua:
-            sh("hyprctl", "eval", f'hl.monitor({{ output = "{connector}", disabled = true }})')
+            sh("hyprctl", "eval", f'hl.monitor({{ output = "{connector}", disabled = true }})', env=hypr)
             time.sleep(off_seconds)
             sh("hyprctl", "eval", f'hl.monitor({{ output = "{connector}", mode = "{mode}", position = "{pos}", '
-                                  f'scale = {m["scale"]:.6f}, transform = {m["transform"]}, disabled = false }})')
+                                  f'scale = {m["scale"]:.6f}, transform = {m["transform"]}, disabled = false }})', env=hypr)
         else:
-            sh("hyprctl", "keyword", "monitor", f"{connector},disable")
+            sh("hyprctl", "keyword", "monitor", f"{connector},disable", env=hypr)
             time.sleep(off_seconds)
-            sh("hyprctl", "keyword", "monitor", f"{connector},{mode},{pos},{m['scale']:.6f},transform,{m['transform']}")
+            sh("hyprctl", "keyword", "monitor", f"{connector},{mode},{pos},{m['scale']:.6f},transform,{m['transform']}", env=hypr)
     elif os.environ.get("SWAYSOCK") and have("swaymsg"):
         log(f"sway: {connector} off for {off_seconds:.0f}s")
         sh("swaymsg", "output", connector, "disable")
@@ -254,20 +395,12 @@ def wake(connector, bus, mode, contrast=None):
     save_state(mode=mode)
 
 
-def connected(connector):
-    for path in glob.glob(f"/sys/class/drm/card*-{connector}"):
-        try:
-            return open(f"{path}/status").read().strip() == "connected" and is_dasung(open(f"{path}/edid", "rb").read())
-        except OSError:
-            pass
-    return False
-
-
 # ---- CLI ----
 
 def main():
     ap = argparse.ArgumentParser(prog="paperlike", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--bus", type=int, help="I2C bus number (default: auto-detect)")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    ap.add_argument("--bus", type=int, help="I2C bus number (default: auto-detect); refused if its EDID or sysfs says it's another monitor")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("detect")
     sub.add_parser("status")
@@ -283,9 +416,12 @@ def main():
     state = load_state()
     if a.cmd == "watch":
         return watch(a, state)
-    connector, bus = find_dasung() if a.bus is None else (state.get("connector", "?"), a.bus)
+    connector, bus = find_dasung() if a.bus is None else dasung_on_bus(a.bus, write=a.cmd not in ("detect", "status"))
 
     if a.cmd == "detect":
+        if connector == "?":
+            raise SystemExit(f"Can't verify /dev/i2c-{bus}: it doesn't answer EDID reads, and sysfs doesn't tie it "
+                             "to a connected Dasung.")
         print(f"Dasung Paperlike on {connector}, I2C bus {bus} (/dev/i2c-{bus})")
         return
     if a.cmd == "wake":
@@ -320,36 +456,55 @@ def main():
 
 
 def watch(a, state):
-    """Wait for the Dasung to appear on any connector, then wake it; repeat on every replug."""
+    """Wait for the Dasung to appear on any connector, then wake it; repeat on every replug.
+    Polls sysfs every 2 s. Looks up the I2C bus (EDID reads on NVIDIA) when the connected Dasungs change,
+    and every 10 s while a connected Dasung's bus isn't known yet."""
     log("watching for the Dasung (Ctrl+C to stop)")
-    was = None
+    seen = None    # {sysfs path: EDID} of the connected Dasungs at the last poll
+    target = None  # (connector, bus), cached until `seen` changes
+    failed = None  # last lookup error, logged once
+    retry = 0      # after a failed lookup, when to try again
     next_clear = 0
     while True:
         try:
-            connector, bus = find_dasung()
-            now = True
-        except SystemExit:
-            connector, now = None, False
-        if now and was is not True:
-            log(f"Dasung appeared on {connector}; waking it in 5s")
-            time.sleep(5)
-            mode = MODES[a.mode] if a.mode else load_state().get("mode", MODES["a5"])
-            try:
-                wake(connector, bus, mode)
-            except (SystemExit, subprocess.CalledProcessError) as e:
-                log(f"wake failed: {e}")
-            next_clear = time.time() + a.clear_every
-        elif now and a.clear_every and time.time() >= next_clear:
-            try:
-                m = Monitor(bus)
-                m.run([(0x06, 0x01)], quiet=True)
-                m.close()
-            except (OSError, SystemExit) as e:
-                log(f"auto clear failed: {e}")
-            next_clear = time.time() + a.clear_every
-        elif not now and was:
-            log("Dasung unplugged")
-        was = now
+            outs = dasung_outputs()
+            # look up the bus again on any change, and every 10 s while a connected Dasung has none yet
+            if outs != seen or (outs and target is None and time.time() >= retry):
+                was, old, seen, target = seen, target, outs, None
+                if not outs:
+                    if was:
+                        log("Dasung unplugged")
+                    failed = None
+                else:
+                    try:
+                        target = find_dasung() if a.bus is None else dasung_on_bus(a.bus)
+                        failed = None
+                    except (OSError, SystemExit) as e:
+                        if str(e) != failed:
+                            log(f"{e} Retrying every 10 s while it's connected.")
+                        failed = str(e)
+                        retry = time.time() + 10
+                if target and target != old:
+                    log(f"Dasung appeared on {target[0]}; waking it in 5s")
+                    time.sleep(5)
+                    mode = MODES[a.mode] if a.mode else load_state().get("mode", MODES["a5"])
+                    try:
+                        wake(*target, mode)
+                    except (Exception, SystemExit) as e:
+                        log(f"wake failed: {e}")
+                    next_clear = time.time() + a.clear_every
+            elif target and a.clear_every and time.time() >= next_clear:
+                try:
+                    m = Monitor(target[1])
+                    try:
+                        m.run([(0x06, 0x01)], quiet=True)
+                    finally:
+                        m.close()
+                except (Exception, SystemExit) as e:
+                    log(f"auto clear failed: {e}")
+                next_clear = time.time() + a.clear_every
+        except (Exception, SystemExit) as e:  # never die on one failure
+            log(f"watch: {e}")
         time.sleep(2)
 
 

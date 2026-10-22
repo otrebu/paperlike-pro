@@ -43,4 +43,5 @@ the GPU's adapters. If you hit DDC timeouts on NVIDIA with other monitors too, d
 ## Permissions
 
 `paperlike` needs read/write on `/dev/i2c-N`. Check with `ls -l /dev/i2c-*` (a `+` means a udev ACL for the
-logged-in user). Otherwise add yourself to the `i2c` group and log in again.
+logged-in user). Otherwise add yourself to the `i2c` group and log in again. The group and the udev rule that gives
+it `/dev/i2c-*` come from a package: on Arch it's `i2c-tools`, so install that first.

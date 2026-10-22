@@ -1,0 +1,26 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # setup-python has no Python 3.8 build for Ubuntu 26.04, so keep 3.8 on 24.04 when ubuntu-latest moves
+    runs-on: ${{ matrix.python == '3.8' && 'ubuntu-24.04' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.10", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile
+        run: python -m py_compile paperlike tools/*.py
+      - name: Unit tests (no I2C)
+        run: python -m unittest discover -s tests -v
+      - name: Help
+        run: ./paperlike --help

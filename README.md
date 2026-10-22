@@ -47,12 +47,100 @@ then sends a mode change and a full clear. That re-locks it.
 Tested on Arch Linux (Omarchy), Hyprland 0.56 and an NVIDIA GPU. The other desktop backends are written but untested.
 macOS and Windows aren't supported yet. The protocol is the same there, see [docs/protocol.md](docs/protocol.md).
 
+## Install
+
+Put `paperlike` on your `PATH`, for example in `~/.local/bin`. From the repo folder:
+
+```sh
+mkdir -p ~/.local/bin
+ln -s "$PWD/paperlike" ~/.local/bin/paperlike      # a symlink follows `git pull`
+# or a copy:  install -m 755 paperlike ~/.local/bin/paperlike
+paperlike --version
+```
+
+The file in the repo is already executable; a copy downloaded on its own needs `chmod +x`.
+
+Load the kernel's `i2c-dev` module now, and at every boot:
+
+```sh
+sudo modprobe i2c-dev
+echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf
+```
+
+Check who can open the buses with `ls -l /dev/i2c-*`. A `+` after the permissions means a udev ACL gives the
+logged-in user access (ddcutil's udev rules do this). Otherwise add yourself to the `i2c` group with
+`sudo usermod -aG i2c "$USER"` and log in again. The group and the udev rule that gives it the buses come from a
+package: on Arch it's `i2c-tools`, so install that first (other distros ship their own equivalent).
+See [docs/troubleshooting.md](docs/troubleshooting.md#permissions).
+
+Then run `paperlike detect` first. It only reads EDIDs and never sends a DDC/CI command, and it should print the
+Dasung's connector and I2C bus.
+
+## Start `watch` at login
+
+The simple way is your compositor's autostart:
+
+```
+hl.on("hyprland.start", function() hl.exec_cmd("paperlike watch") end)   -- Hyprland 0.56+ Lua config
+exec-once = paperlike watch                                               # hyprland.conf
+exec paperlike watch                                                      # sway
+```
+
+Or run it as a systemd user service, which restarts it if it fails and keeps its log in the journal.
+[contrib/paperlike-watch.service](contrib/paperlike-watch.service) runs `~/.local/bin/paperlike watch` with
+the graphical session:
+
+```sh
+mkdir -p ~/.config/systemd/user
+cp contrib/paperlike-watch.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now paperlike-watch.service
+journalctl --user -u paperlike-watch -f          # its log
+```
+
+`wake` switches the output through the compositor, so the service needs the compositor's environment. Session
+managers like uwsm pass it to user services and start `graphical-session.target` for you
+(`systemctl --user is-active graphical-session.target` tells you). Without one, run this as a single autostart
+command (one `exec-once =` line in hyprland.conf, one `exec` line in sway), so the service only starts once the
+environment is in. It works on any desktop: variables that aren't set are skipped.
+
+```sh
+systemctl --user import-environment WAYLAND_DISPLAY DISPLAY XAUTHORITY HYPRLAND_INSTANCE_SIGNATURE SWAYSOCK && systemctl --user start paperlike-watch.service
+```
+
+If `HYPRLAND_INSTANCE_SIGNATURE` is missing, or names a Hyprland that has since exited, the tool uses the running
+Hyprland instance it finds under `$XDG_RUNTIME_DIR/hypr`.
+
+## Hotkeys
+
+Suggested keys, like the vendor app's Alt+C. Check they're free in your config first.
+
+| Keys | Command |
+|---|---|
+| Super+Alt+C | `paperlike clear` (quick clear) |
+| Super+Alt+Shift+C | `paperlike clear --full` |
+| Super+Alt+A | `paperlike mode a2` |
+| Super+Alt+D | `paperlike mode floyd` |
+| Super+Alt+P | `paperlike mode 16` |
+| Super+Alt+W | `paperlike wake` |
+
+- [contrib/hyprland-binds.lua](contrib/hyprland-binds.lua): Hyprland 0.56+ Lua config,
+  `hl.bind("SUPER + ALT + C", hl.dsp.exec_cmd("paperlike clear"))`
+- [contrib/hyprland-binds.conf](contrib/hyprland-binds.conf): classic hyprland.conf, `bind = SUPER ALT, C, exec, paperlike clear`
+- [contrib/sway-binds.conf](contrib/sway-binds.conf): sway, `bindsym Mod4+Mod1+c exec paperlike clear`
+
+None of the three has been tried live yet. The Lua binds follow Hyprland 0.56's Lua config API (as Omarchy uses
+it); the hyprland.conf and sway versions follow those configs' documented syntax.
+Hotkeys and autostart lines run with the compositor's `PATH`; if that doesn't include `~/.local/bin`, write the
+full path to `paperlike`.
+
 ## Safety
 
 On a normal monitor, VCP code 0x08 (the code Dasung reuses for every command) means **"restore colour defaults"**.
 The tool only writes to an I2C bus whose EDID belongs to a DASUNG display, or to the cached bus for that same
-connector when a half-started monitor stops answering EDID reads. If you pass `--bus N` by hand, make sure it's
-the Dasung.
+connector when a half-started monitor stops answering EDID reads. `--bus N` is refused when the bus's EDID, or
+the sysfs `ddc` link that ties it to a connector, belongs to another monitor. If the bus doesn't answer EDID reads
+and has no `ddc` link (NVIDIA), the tool only checks that it's on the Dasung's GPU, so make sure it's the Dasung.
 
 E Ink panels wear with refreshes. Dasung advises against video and games on this monitor.
 
@@ -65,7 +153,19 @@ E Ink panels wear with refreshes. Dasung advises against video and games on this
 - [docs/experiments.md](docs/experiments.md): measured speed, contrast and grey rendering of every mode
 
 `tools/` holds the research probes used along the way: a read-only DDC/CI probe and three tools for the service
-serial port. They aren't needed for normal use.
+serial port. They aren't needed for normal use. `contrib/` holds the systemd unit and the hotkey snippets.
+
+## Tests
+
+The unit tests don't need the monitor:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+## Versions
+
+- **0.1.0**: the first numbered version. `paperlike --version` prints it.
 
 ## Credits and sources
 

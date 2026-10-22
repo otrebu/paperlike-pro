@@ -1,0 +1,20 @@
+# systemd user unit: run `paperlike watch` for the whole graphical session.
+#   mkdir -p ~/.config/systemd/user && cp contrib/paperlike-watch.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now paperlike-watch.service
+#   journalctl --user -u paperlike-watch -f
+# `wake` needs the desktop's environment (WAYLAND_DISPLAY, DISPLAY, HYPRLAND_INSTANCE_SIGNATURE or SWAYSOCK),
+# see "Start watch at login" in the README.
+
+[Unit]
+Description=Wake the DASUNG Paperlike Pro whenever it is plugged in
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+# add options here, e.g. --mode a2 or --clear-every 120
+ExecStart=%h/.local/bin/paperlike watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
