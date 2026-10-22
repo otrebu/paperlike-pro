@@ -31,7 +31,7 @@ then sends a mode change and a full clear. That re-locks it.
 | `floyd` | `07 01` | Dithered greys, good all-round |
 | `a2` | `07 02` | Pure black and white, fast, crisp text |
 | `16` | `07 03` | 16 greys, slowest, best for photos |
-| `a5` | `07 04` | Dasung's fast mode. The vendor app only offers it at 800×600, but it also works at full 1600×1200 |
+| `a5` | `07 04` | Dasung's fast mode. The vendor app only offers it at 800×600. At 1600×1200 it works but measures the same as A2 |
 | `a2-low` / `a61` | `07 05` / `07 06` | The vendor's 800×600 modes |
 
 `a5` is the default for `wake` and `watch`.
@@ -62,6 +62,7 @@ E Ink panels wear with refreshes. Dasung advises against video and games on this
 - [docs/hardware.md](docs/hardware.md): what's inside, the LED colours, the hidden service port
 - [docs/troubleshooting.md](docs/troubleshooting.md): black screen, noise, power, NVIDIA
 - [docs/research-log.md](docs/research-log.md): how this was worked out
+- [docs/experiments.md](docs/experiments.md): measured speed, contrast and grey rendering of every mode
 
 `tools/` holds the research probes used along the way: a read-only DDC/CI probe and three tools for the service
 serial port. They aren't needed for normal use.
