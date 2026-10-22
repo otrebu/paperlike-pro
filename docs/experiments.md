@@ -44,3 +44,17 @@ Takeaways:
 - Mixed content with some greys: Floyd with `paperlike contrast 1`.
 - Photos: 16.
 - Maximum speed with greys: 800×600 + A5, at the cost of resolution.
+
+## Tier 2: status reads, the free command number, running without software (22 Oct 2026)
+
+- **A standard Get VCP 0x08 works.** `51 82 01 08 b4`, then a read 0.1 s later, returns the usual reply
+  (`6e 88 02 00 08 00 00 01 00 02 bf`, i.e. "heartbeat OK") without sending any command. `paperlike status` now
+  uses this, so checking the monitor is read-only. `ddcutil -b N getvcp 08` still fails ("DDC communication failed").
+- **`0D 00`**, the only unused number in the 4-bit command field, did nothing visible. The reply was the normal
+  "heartbeat OK". It didn't get the `06/04` reply that `06 03` got, so `06/04` isn't a general "not supported" answer.
+- **No heartbeat needed.** With a static test card and no DDC traffic at all for 10 minutes (a webcam still every
+  30 s), the picture didn't change: no warning screen, no sleep. A status read afterwards answered "heartbeat OK".
+  The Paperlike HD reportedly shows an "install the driver" warning without heartbeats. This Pro doesn't, at least
+  over 10 minutes.
+
+Not tested yet: `03 01` (monitor off in Dasung's source, with `03 00` presumably back on).

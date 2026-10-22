@@ -5,7 +5,7 @@ Every command is "Set VCP 0x08 = CMD:ARG" (see NOTES.md). The monitor answers ea
 11-byte reply whose ML byte is a type (01 heartbeat, 07 mode/button) and SL byte a value.
 
   paperlike detect                  find the monitor (connector, I2C bus)
-  paperlike status                  heartbeat; prints the monitor's reply
+  paperlike status                  read-only status query; prints the monitor's reply
   paperlike mode a5                 floyd | a2 | 16 | a5 | a2-low | a61 (a5 is the fastest, fine at full res)
   paperlike contrast 6              per-mode contrast (floyd 1-9, a2 130-250, a5 80-200)
   paperlike clear [--full]          ghost clear (quick by default)
@@ -137,6 +137,16 @@ class Monitor:
             return r[7], r[9] & 0x0F
         return None
 
+    def get(self):
+        """Read-only status: a standard Get VCP 0x08 request (sends no command)."""
+        body = bytes([0x51, 0x82, 0x01, 0x08])
+        os.write(self.fd, body + bytes([xor(body, 0x6E)]))
+        time.sleep(0.1)
+        r = os.read(self.fd, 11)
+        if len(r) == 11 and r[2] == 0x02 and r[4] == 0x08 and r[10] == xor(r[:10], 0x50):
+            return r[7], r[9] & 0x0F
+        return None
+
     def run(self, pairs, quiet=False):
         replies = []
         for cmd, arg in pairs:
@@ -158,9 +168,9 @@ def describe(rep):
     if kind == 0x01 and value == 2:
         return "alive (heartbeat OK)"
     if kind == 0x07 and 1 <= value <= 6:
-        return f"mode {value} ({MODE_NAMES.get(value, '?')}; in 800x600 mode 1-3 mean a5/a2-low/a61)"
+        return f"alive, last change: mode {value} ({MODE_NAMES.get(value, '?')})"
     if kind == 0x07 and value == 8:
-        return "screensaver cancelled"
+        return "alive, last change: ghost clear (or screensaver cancelled)"
     return f"type {kind:#04x} value {value}"
 
 
@@ -285,11 +295,11 @@ def main():
     m = Monitor(bus)
     try:
         if a.cmd == "status":
-            # the first reply carries the last event (e.g. a button press), the second the heartbeat itself
-            event, beat = m.run([(0x01, 0x01), (0x01, 0x01)], quiet=True)
-            if event != beat:
-                print(f"last event: {describe(event)}")
-            print(describe(beat))
+            # read-only: the reply carries the latest event (mode change, button press, clear) or "heartbeat OK"
+            try:
+                print(describe(m.get()))
+            except OSError as e:
+                raise SystemExit(f"no answer from the monitor ({e.strerror}). Try `paperlike wake`.")
         elif a.cmd == "mode":
             mode = MODES[a.name]
             m.run(mode_pairs(mode, a.contrast) + [(0x06, 0x02)])

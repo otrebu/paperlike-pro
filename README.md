@@ -8,7 +8,7 @@ It talks to the monitor over the HDMI cable's DDC/CI channel, the same way Dasun
 
 ```sh
 ./paperlike detect           # find the monitor and its I2C bus
-./paperlike status           # is it alive? ("heartbeat OK")
+./paperlike status           # read-only: is it alive, and what changed last
 ./paperlike mode a5          # floyd | a2 | 16 | a5 | a2-low | a61
 ./paperlike contrast 200     # contrast for the current mode
 ./paperlike clear --full     # clear ghosting (quick without --full)
