@@ -28,13 +28,17 @@ After a command, wait 0.1–0.8 s (see the timings below) and do a plain 11-byte
 6E 88 02 <rc> 08 <type> <MH> <ML> <SH> <SL> <checksum>     checksum = 0x50 ^ bytes 0..9
 ```
 
+A standard Get VCP request for 0x08 (`51 82 01 08 b4`) also gets this reply on Dasung firmware: a leaked
+vendor test log has thousands of them from a DSC0001 monitor. That's not yet confirmed on our unit.
+
 It has the shape of a Get-VCP reply. The apps use **ML as a packet type** and **SL & 0x0F as the value**:
 
 | ML (type) | SL | Meaning |
 |---|---|---|
 | `01` | `02` | Heartbeat OK |
 | `07` | 1–6 | Current mode (after a mode command, or after the M button). The apps assume 1–3 in 800×600 mode and add 3, but this unit reported 4 directly after `07 04` |
-| `07` | `08` | Screensaver cancelled. Also seen as the reply to clears |
+| `07` | `08` | Acknowledges a clear. It repeats for a few seconds afterwards (the vendor apps also read it as "screensaver cancelled") |
+| `06` | `04` | Seen once, after `06 03`, which the Pro didn't act on. Possibly "not supported" |
 
 A reply carries the latest event, so the first reply after a button press reports the press and the next
 heartbeat reports "OK". **There is no command to read back the current mode, contrast, firmware version or
@@ -42,20 +46,23 @@ temperature.**
 
 ## Command table
 
-| CMD | ARG | What it does | Status |
-|---|---|---|---|
-| `01` | `01` | Heartbeat ("normal"). The apps send it every 200–300 ms | confirmed |
-| `02` | `01` / `00` | Enter / leave the monitor's screensaver. HD tools also use `02 02` | from the apps |
-| `03` | `01` | Monitor off (Dasung source). HD tools: `03 02` = on (needs a clear) | untested, avoid |
-| `04` | `01` / `02` | Resolution mode: normal / 800×600 | confirmed |
-| `05` | 0–255 | Generic threshold, sent once on connect by the 2017 Linux app only | from the apps |
-| `06` | `01` / `02` | Quick ghost clear / full clear (the whole panel flashes) | confirmed |
-| `07` | 1–6 | Image mode, see below | confirmed |
-| `08` | 1–9 | Floyd contrast level | confirmed |
-| `09` | 130–250 | A2 contrast (steps of 5 in the apps) | confirmed |
-| `0A` | 130–250 | A2 contrast in 800×600 mode | from the apps |
-| `0B` | 80–200 | A5 contrast | confirmed |
-| `0C`, `0E`, `0F` | | Paperlike HD only (speed, front lights) | not on the Pro |
+Dasung's own names for the commands come from debug symbol files shipped alongside their 2018 Windows apps.
+
+| CMD | Dasung's name | ARG | What it does | Status |
+|---|---|---|---|---|
+| `01` | BEAT_SIGNAL | `01` | Heartbeat ("normal"). The apps send it every 200–300 ms | confirmed |
+| `02` | SCREENSAVER_SIGNAL | `01` / `00` | Enter / leave the monitor's screensaver. HD tools also use `02 02` | from the apps |
+| `03` | TURNOFFMONITOR_SIGNAL | `01` | Monitor off (Dasung source). HD tools: `03 02` = on (needs a clear) | untested, avoid |
+| `04` | MONITORRESOLUTION_SIGNAL | `01` / `02` | Resolution mode: normal / 800×600 | confirmed |
+| `05` | THRESHOLD_SIGNAL | 0–255 | Generic threshold, sent once on connect by the 2017 Linux app only | from the apps |
+| `06` | CLEANMONITOR_SIGNAL | `01` / `02` | Quick ghost clear / full clear (the whole panel flashes). `06 03` (both bits) did nothing on our Pro and got reply type 06/04 | confirmed |
+| `07` | DISPALYMODE_SIGNAL (sic) | 1–6 | Image mode, see below | confirmed |
+| `08` | THRESHOLD_FLOYD | 1–9 | Floyd contrast level | confirmed |
+| `09` | THRESHOLD_A2H | 130–250 | A2 contrast (steps of 5 in the apps) | confirmed |
+| `0A` | THRESHOLD_A2L | 130–250 | A2 contrast in 800×600 mode | from the apps |
+| `0B` | THRESHOLD_A5L | 80–200 | A5 contrast | confirmed |
+| `0C`, `0E`, `0F` | ADVANCED_SPEED, lights | | Paperlike HD only (ink speed, front lights). Not in the Pro app's symbols | don't send to a Pro |
+| `0D` | none | | The only number not used in the 4-bit command field | unknown |
 
 ## Image modes (`07 nn`)
 

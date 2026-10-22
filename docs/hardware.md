@@ -55,6 +55,11 @@ Most likely it only responds to Dasung's own (unpublished) update tool or to a s
 Windows apps (1.0.5–1.0.8) use a serial port. No firmware image for the Pro is publicly available. Dasung
 support handled firmware privately or by swapping the main board.
 
+A search of about 40 Dasung releases (2015–2026, live and archived) found no Pro firmware image, MCU hex, FPGA
+bitstream, waveform file or update tool. Without one, writing anything to the board is likely to brick it.
+The realistic options are asking Dasung support, or a read-only backup of the board's SOIC-8 flash with a clip and
+a programmer, which means opening the case.
+
 Later Dasung models (HD Revolutionary, 253, 13K, 103) use a different scheme: a CH340 serial control port with
 ASCII-hex frames `5FF5 … A0FA` at 115200 8N1, and firmware updates via `ch341prog`. See
 [sal7g86/eink-dasung-control](https://github.com/sal7g86/eink-dasung-control). That isn't how the Pro works.
