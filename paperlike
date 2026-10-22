@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""paperlike: control a DASUNG Paperlike Pro e-ink monitor over its HDMI control channel (DDC/CI).
+
+Every command is "Set VCP 0x08 = CMD:ARG" (see NOTES.md). The monitor answers each one with an
+11-byte reply whose ML byte is a type (01 heartbeat, 07 mode/button) and SL byte a value.
+
+  paperlike detect                  find the monitor (connector, I2C bus)
+  paperlike status                  heartbeat; prints the monitor's reply
+  paperlike mode a5                 floyd | a2 | 16 | a5 | a2-low | a61 (a5 is the fastest, fine at full res)
+  paperlike contrast 6              per-mode contrast (floyd 1-9, a2 130-250, a5 80-200)
+  paperlike clear [--full]          ghost clear (quick by default)
+  paperlike wake [--mode a2]        bring the picture back: re-send HDMI, then mode + full clear
+  paperlike watch                   wake automatically whenever the monitor is plugged in
+  paperlike raw 07 02 06 02         send raw CMD ARG pairs (hex)
+
+Linux only for now (i2c-dev). wake/watch re-send the picture through the desktop's own tools:
+Hyprland (hyprctl), sway (swaymsg), other wlroots compositors (wlr-randr), KDE (kscreen-doctor), X11 (xrandr).
+"""
+import argparse
+import fcntl
+import glob
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+I2C_SLAVE = 0x0703
+DDC_ADDR = 0x37
+EDID_ADDR = 0x50
+# a5/a2-low/a61 are the vendor's 800x600 modes, but a5 also works at 1600x1200 (tested 22 Oct 2026)
+MODES = {"floyd": 1, "a2": 2, "16": 3, "a5": 4, "a2-low": 5, "a61": 6}
+MODE_NAMES = {v: k for k, v in MODES.items()}
+# mode -> (contrast command, min, max, default), from the vendor apps
+CONTRAST = {1: (0x08, 1, 9, 5), 2: (0x09, 130, 250, 190), 4: (0x0B, 80, 200, 160), 5: (0x0A, 130, 250, 190)}
+# how long the vendor apps wait before reading the reply (seconds)
+WAITS = {0x01: 0.1, 0x02: 0.6, 0x04: 0.6, 0x06: 0.5, 0x07: 0.8}
+STATE = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "paperlike", "state.json")
+
+
+def log(msg):
+    print(f"{time.strftime('%T')} {msg}", flush=True)
+
+
+def xor(data, seed):
+    for b in data:
+        seed ^= b
+    return seed
+
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(**kw):
+    s = load_state()
+    s.update(kw)
+    os.makedirs(os.path.dirname(STATE), exist_ok=True)
+    with open(STATE, "w") as f:
+        json.dump(s, f)
+
+
+# ---- finding the monitor (Linux DRM + i2c-dev) ----
+
+def is_dasung(edid):
+    # PnP ID "DSC" (0x12 0x63) or the product name the vendor apps match on
+    return len(edid) >= 128 and (edid[8:10] == b"\x12\x63" or b"DASUNG" in edid[:128])
+
+
+def read_edid(bus):
+    fd = os.open(f"/dev/i2c-{bus}", os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, I2C_SLAVE, EDID_ADDR)
+        os.write(fd, b"\x00")
+        return os.read(fd, 128)
+    finally:
+        os.close(fd)
+
+
+def find_dasung():
+    """Return (connector, bus) or raise. Only ever reads (EDID); never writes to other monitors."""
+    state = load_state()
+    for path in sorted(glob.glob("/sys/class/drm/card*-*")):
+        try:
+            if open(f"{path}/status").read().strip() != "connected":
+                continue
+            edid = open(f"{path}/edid", "rb").read()
+        except OSError:
+            continue
+        if not is_dasung(edid):
+            continue
+        connector = os.path.basename(path).split("-", 1)[1]
+        ddc = os.path.join(path, "ddc")
+        if os.path.islink(ddc):  # i915/amdgpu/nouveau expose the bus directly
+            return connector, int(os.path.basename(os.readlink(ddc)).split("-")[1])
+        # NVIDIA: match the EDID on the buses that belong to the same GPU
+        card = os.path.realpath(os.path.join(os.path.dirname(path), os.path.basename(path).split("-")[0], "device"))
+        for dev in sorted(glob.glob("/sys/bus/i2c/devices/i2c-*")):
+            if not os.path.realpath(dev).startswith(card + "/"):
+                continue
+            bus = int(dev.rsplit("-", 1)[1])
+            try:
+                if read_edid(bus)[:128] == edid[:128]:
+                    save_state(connector=connector, bus=bus)
+                    return connector, bus
+            except OSError:
+                continue
+        # a half-booted Dasung stops answering EDID reads; fall back to the last bus that matched
+        if state.get("connector") == connector and "bus" in state:
+            return connector, state["bus"]
+        raise SystemExit(f"Found the Dasung on {connector} but not its I2C bus. Pass --bus N (see `ddcutil detect`).")
+    raise SystemExit("No Dasung Paperlike connected (no DRM connector with a DASUNG EDID).")
+
+
+# ---- talking to it ----
+
+class Monitor:
+    def __init__(self, bus):
+        self.bus = bus
+        self.fd = os.open(f"/dev/i2c-{bus}", os.O_RDWR)
+        fcntl.ioctl(self.fd, I2C_SLAVE, DDC_ADDR)
+
+    def close(self):
+        os.close(self.fd)
+
+    def send(self, cmd, arg):
+        body = bytes([0x51, 0x84, 0x03, 0x08, cmd, arg])
+        os.write(self.fd, body + bytes([xor(body, 0x6E)]))
+        time.sleep(WAITS.get(cmd, 0.5))
+        r = os.read(self.fd, 11)
+        if len(r) == 11 and r[2] == 0x02 and r[4] == 0x08 and r[10] == xor(r[:10], 0x50):
+            return r[7], r[9] & 0x0F
+        return None
+
+    def run(self, pairs, quiet=False):
+        replies = []
+        for cmd, arg in pairs:
+            try:
+                rep = self.send(cmd, arg)
+            except OSError as e:
+                raise SystemExit(f"{cmd:02x} {arg:02x}: no answer from the monitor ({e.strerror}). Try `paperlike wake`.")
+            replies.append(rep)
+            if not quiet:
+                log(f"{cmd:02x} {arg:02x} -> " + (f"type={rep[0]:#04x} value={rep[1]}" if rep else "invalid reply"))
+            time.sleep(0.2)
+        return replies
+
+
+def describe(rep):
+    if rep is None:
+        return "no valid reply"
+    kind, value = rep
+    if kind == 0x01 and value == 2:
+        return "alive (heartbeat OK)"
+    if kind == 0x07 and 1 <= value <= 6:
+        return f"mode {value} ({MODE_NAMES.get(value, '?')}; in 800x600 mode 1-3 mean a5/a2-low/a61)"
+    if kind == 0x07 and value == 8:
+        return "screensaver cancelled"
+    return f"type {kind:#04x} value {value}"
+
+
+def mode_pairs(mode, contrast=None):
+    pairs = [(0x07, mode)]
+    if mode in CONTRAST:
+        cmd, lo, hi, default = CONTRAST[mode]
+        value = default if contrast is None else contrast
+        if not lo <= value <= hi:
+            raise SystemExit(f"contrast for {MODE_NAMES[mode]} is {lo}-{hi}")
+        pairs.append((cmd, value))
+    return pairs
+
+
+# ---- re-sending the picture (per desktop) ----
+
+def have(cmd):
+    return shutil.which(cmd) is not None
+
+
+def sh(*args):
+    subprocess.run(args, check=True, stdout=subprocess.DEVNULL)
+
+
+def relink(connector, off_seconds=4.0, settle=8.0):
+    """Turn the output off and on so the monitor's video input re-locks onto the signal.
+    Returns the output width when known (800 means the monitor should be in its 800x600 mode)."""
+    width = None
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and have("hyprctl"):
+        mons = json.loads(subprocess.run(["hyprctl", "monitors", "-j"], check=True, capture_output=True, text=True).stdout)
+        m = next((m for m in mons if m["name"] == connector), None)
+        if m is None:
+            raise SystemExit(f"Hyprland doesn't list {connector} as active")
+        width = m["width"]
+        mode = f"{m['width']}x{m['height']}@{m['refreshRate']:.2f}"
+        pos = f"{m['x']}x{m['y']}"
+        lua = subprocess.run(["hyprctl", "eval", "return 1"], capture_output=True, text=True).stdout.strip() == "ok"
+        log(f"hyprland: {connector} off for {off_seconds:.0f}s, then back to {mode} at {pos} scale {m['scale']:.4g}")
+        if lua:
+            sh("hyprctl", "eval", f'hl.monitor({{ output = "{connector}", disabled = true }})')
+            time.sleep(off_seconds)
+            sh("hyprctl", "eval", f'hl.monitor({{ output = "{connector}", mode = "{mode}", position = "{pos}", '
+                                  f'scale = {m["scale"]:.6f}, transform = {m["transform"]}, disabled = false }})')
+        else:
+            sh("hyprctl", "keyword", "monitor", f"{connector},disable")
+            time.sleep(off_seconds)
+            sh("hyprctl", "keyword", "monitor", f"{connector},{mode},{pos},{m['scale']:.6f},transform,{m['transform']}")
+    elif os.environ.get("SWAYSOCK") and have("swaymsg"):
+        log(f"sway: {connector} off for {off_seconds:.0f}s")
+        sh("swaymsg", "output", connector, "disable")
+        time.sleep(off_seconds)
+        sh("swaymsg", "output", connector, "enable")
+    elif os.environ.get("WAYLAND_DISPLAY") and have("wlr-randr"):
+        log(f"wlr-randr: {connector} off for {off_seconds:.0f}s")
+        sh("wlr-randr", "--output", connector, "--off")
+        time.sleep(off_seconds)
+        sh("wlr-randr", "--output", connector, "--on")
+    elif os.environ.get("WAYLAND_DISPLAY") and have("kscreen-doctor"):
+        log(f"kscreen-doctor: {connector} off for {off_seconds:.0f}s")
+        sh("kscreen-doctor", f"output.{connector}.disable")
+        time.sleep(off_seconds)
+        sh("kscreen-doctor", f"output.{connector}.enable")
+    elif os.environ.get("DISPLAY") and have("xrandr"):
+        log(f"xrandr: {connector} off for {off_seconds:.0f}s (X11 names can differ, e.g. HDMI-0)")
+        sh("xrandr", "--output", connector, "--off")
+        time.sleep(off_seconds)
+        sh("xrandr", "--output", connector, "--auto")
+    else:
+        raise SystemExit("Don't know how to switch outputs on this desktop. Unplug and replug the HDMI, then run `paperlike clear --full`.")
+    time.sleep(settle)
+    return width
+
+
+def wake(connector, bus, mode, contrast=None):
+    width = relink(connector)
+    m = Monitor(bus)
+    try:
+        m.run([(0x04, 0x02 if width == 800 else 0x01)] + mode_pairs(mode, contrast) + [(0x06, 0x02)])
+    finally:
+        m.close()
+    save_state(mode=mode)
+
+
+def connected(connector):
+    for path in glob.glob(f"/sys/class/drm/card*-{connector}"):
+        try:
+            return open(f"{path}/status").read().strip() == "connected" and is_dasung(open(f"{path}/edid", "rb").read())
+        except OSError:
+            pass
+    return False
+
+
+# ---- CLI ----
+
+def main():
+    ap = argparse.ArgumentParser(prog="paperlike", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--bus", type=int, help="I2C bus number (default: auto-detect)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("detect")
+    sub.add_parser("status")
+    p = sub.add_parser("mode"); p.add_argument("name", choices=MODES); p.add_argument("--contrast", type=int)
+    p = sub.add_parser("contrast"); p.add_argument("value", type=int); p.add_argument("--mode", choices=MODES)
+    p = sub.add_parser("clear"); p.add_argument("--full", action="store_true")
+    p = sub.add_parser("wake"); p.add_argument("--mode", choices=MODES)
+    p = sub.add_parser("watch"); p.add_argument("--mode", choices=MODES)
+    p.add_argument("--clear-every", type=float, default=0, help="quick clear every N seconds (vendor default 120)")
+    p = sub.add_parser("raw"); p.add_argument("bytes", nargs="+")
+    a = ap.parse_args()
+
+    state = load_state()
+    if a.cmd == "watch":
+        return watch(a, state)
+    connector, bus = find_dasung() if a.bus is None else (state.get("connector", "?"), a.bus)
+
+    if a.cmd == "detect":
+        print(f"Dasung Paperlike on {connector}, I2C bus {bus} (/dev/i2c-{bus})")
+        return
+    if a.cmd == "wake":
+        mode = MODES[a.mode] if a.mode else state.get("mode", MODES["a5"])
+        return wake(connector, bus, mode)
+
+    m = Monitor(bus)
+    try:
+        if a.cmd == "status":
+            # the first reply carries the last event (e.g. a button press), the second the heartbeat itself
+            event, beat = m.run([(0x01, 0x01), (0x01, 0x01)], quiet=True)
+            if event != beat:
+                print(f"last event: {describe(event)}")
+            print(describe(beat))
+        elif a.cmd == "mode":
+            mode = MODES[a.name]
+            m.run(mode_pairs(mode, a.contrast) + [(0x06, 0x02)])
+            save_state(mode=mode)
+        elif a.cmd == "contrast":
+            mode = MODES[a.mode] if a.mode else state.get("mode", MODES["a2"])
+            if mode not in CONTRAST:
+                raise SystemExit(f"{MODE_NAMES[mode]} has no contrast setting")
+            m.run(mode_pairs(mode, a.value)[1:] + [(0x06, 0x01)])
+        elif a.cmd == "clear":
+            m.run([(0x06, 0x02 if a.full else 0x01)])
+        elif a.cmd == "raw":
+            if len(a.bytes) % 2:
+                raise SystemExit("raw takes CMD ARG pairs")
+            m.run([(int(a.bytes[i], 16), int(a.bytes[i + 1], 16)) for i in range(0, len(a.bytes), 2)])
+    finally:
+        m.close()
+
+
+def watch(a, state):
+    """Wait for the Dasung to appear on any connector, then wake it; repeat on every replug."""
+    log("watching for the Dasung (Ctrl+C to stop)")
+    was = None
+    next_clear = 0
+    while True:
+        try:
+            connector, bus = find_dasung()
+            now = True
+        except SystemExit:
+            connector, now = None, False
+        if now and was is not True:
+            log(f"Dasung appeared on {connector}; waking it in 5s")
+            time.sleep(5)
+            mode = MODES[a.mode] if a.mode else load_state().get("mode", MODES["a5"])
+            try:
+                wake(connector, bus, mode)
+            except (SystemExit, subprocess.CalledProcessError) as e:
+                log(f"wake failed: {e}")
+            next_clear = time.time() + a.clear_every
+        elif now and a.clear_every and time.time() >= next_clear:
+            try:
+                m = Monitor(bus)
+                m.run([(0x06, 0x01)], quiet=True)
+                m.close()
+            except (OSError, SystemExit) as e:
+                log(f"auto clear failed: {e}")
+            next_clear = time.time() + a.clear_every
+        elif not now and was:
+            log("Dasung unplugged")
+        was = now
+        time.sleep(2)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
